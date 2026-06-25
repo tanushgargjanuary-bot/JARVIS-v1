@@ -1,8 +1,13 @@
 """
-JARVIS v3 - Core Engine
+JARVIS v4 - Core Engine
 =======================
 Voice engine, AI brain, memory system, and config loader.
 This is the heart of JARVIS. All other modules import from here.
+
+v4 Changes:
+- Supports chat database, RAG, and agent tools
+- Enhanced system prompt with tool awareness
+- Improved error handling and rate limiting
 """
 
 import os
@@ -36,9 +41,10 @@ MEMORY_DIR = BASE_DIR / "memory"
 NOTES_DIR = BASE_DIR / "notes"
 SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 LOGS_DIR = BASE_DIR / "logs"
+RAG_DIR = BASE_DIR / "rag"
 
 # Ensure directories exist
-for d in [MEMORY_DIR, NOTES_DIR, SCREENSHOTS_DIR, LOGS_DIR]:
+for d in [MEMORY_DIR, NOTES_DIR, SCREENSHOTS_DIR, LOGS_DIR, RAG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Environment variables
@@ -48,6 +54,8 @@ CITY = os.getenv("CITY", "New York")
 WAKE_WORD = os.getenv("WAKE_WORD", "jarvis").lower()
 VOICE_SPEED = int(os.getenv("VOICE_SPEED", "172"))
 MAX_MEMORY = int(os.getenv("MAX_MEMORY", "30"))
+AGENT_TOOLS_ENABLED = os.getenv("AGENT_TOOLS_ENABLED", "true").lower() == "true"
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").lower() == "true"
 
 # Validate Groq API key
 if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_key_here":
@@ -262,16 +270,16 @@ listener = ListenEngine()
 # ============================================================
 
 class GroqBrain:
-    """Handles all AI interactions via Groq API (llama3-8b)."""
+    """Handles all AI interactions via Groq API with tool awareness."""
 
     SYSTEM_PROMPT = (
-        "You are JARVIS, a witty and highly capable AI assistant inspired by Tony Stark's JARVIS. "
-        "You are an expert in Python programming, Data Structures & Algorithms, Web Development, and Linux. "
-        "You assist with coding, debugging, system control, and general knowledge. "
-        "Keep responses SHORT and concise (2-3 sentences max) since they will be spoken aloud. "
+        "You are JARVIS v4, a witty and highly capable AI assistant inspired by Tony Stark's JARVIS. "
+        "You are an expert in Python programming, Data Structures & Algorithms, Web Development, and system automation. "
+        "You assist with coding, debugging, system control, document analysis, and general knowledge. "
+        "You have access to tools: web_search, run_python, calculator, file_operations, system_info, datetime_tool. "
+        "Keep responses concise (2-3 sentences) since they may be spoken aloud. "
         "Be clever, slightly sarcastic, but always helpful. "
-        "Remember context from the current session. "
-        "If asked to code, provide clean, well-commented code. "
+        "When users ask about uploaded documents, use the document context provided. "
         f"The user's name is {OWNER_NAME}."
     )
 
@@ -314,7 +322,7 @@ class GroqBrain:
         recent = self.conversation_memory[-MAX_MEMORY:]
         self.conversation_memory = [system_msg] + recent
 
-    def ask_jarvis(self, prompt: str) -> str:
+    def ask_jarvis(self, prompt: str, model: str = None, max_tokens: int = 512) -> str:
         """
         Send prompt to Groq and return AI response.
         Handles rate limits, auth errors, and network issues.
@@ -327,8 +335,8 @@ class GroqBrain:
         try:
             chat_completion = self.client.chat.completions.create(
                 messages=self.conversation_memory,
-                model="llama3-8b-8192",
-                max_tokens=512,
+                model=model or "llama3-8b-8192",
+                max_tokens=max_tokens,
                 temperature=0.7,
             )
             response = chat_completion.choices[0].message.content
@@ -346,6 +354,17 @@ class GroqBrain:
             else:
                 return f"AI brain hiccupped: {str(e)[:100]}. Try again?"
 
+    def ask_with_tools(self, prompt: str) -> Dict:
+        """Ask JARVIS with potential tool calling (requires agent_tools module)."""
+        if not AGENT_TOOLS_ENABLED:
+            return {"response": self.ask_jarvis(prompt), "tool_calls": []}
+
+        try:
+            from jarvis_agent_tools import agent
+            return agent.process_with_tools(prompt)
+        except ImportError:
+            return {"response": self.ask_jarvis(prompt), "tool_calls": []}
+
     def ask_code(self, prompt: str) -> str:
         """Specialized prompt for code generation with explicit instructions."""
         code_prompt = (
@@ -356,7 +375,7 @@ class GroqBrain:
             "- Handle edge cases\n"
             "- Return ONLY the code block, no explanations before or after"
         )
-        return self.ask_jarvis(code_prompt)
+        return self.ask_jarvis(code_prompt, max_tokens=1024)
 
     def ask_explanation(self, topic: str) -> str:
         """Get a concise explanation of a topic."""
@@ -379,6 +398,16 @@ class GroqBrain:
             "Provide Big O notation with a brief explanation. Keep it short."
         )
         return self.ask_jarvis(comp_prompt)
+
+    def ask_with_context(self, prompt: str, context: str) -> str:
+        """Ask JARVIS with additional document context (for RAG)."""
+        contextual_prompt = (
+            f"Use the following document context to answer the question. "
+            f"If the answer isn't in the context, say so.\n\n"
+            f"Context:\n{context[:4000]}\n\n"
+            f"Question: {prompt}"
+        )
+        return self.ask_jarvis(contextual_prompt, max_tokens=1024)
 
 
 # Global brain instance
@@ -526,8 +555,8 @@ def get_timestamp() -> str:
 __all__ = [
     'voice', 'speak', 'listener', 'brain', 'memory',
     'GROQ_API_KEY', 'OWNER_NAME', 'CITY', 'WAKE_WORD',
-    'VOICE_SPEED', 'MAX_MEMORY',
-    'BASE_DIR', 'MEMORY_DIR', 'NOTES_DIR', 'SCREENSHOTS_DIR', 'LOGS_DIR',
+    'VOICE_SPEED', 'MAX_MEMORY', 'AGENT_TOOLS_ENABLED', 'RAG_ENABLED',
+    'BASE_DIR', 'MEMORY_DIR', 'NOTES_DIR', 'SCREENSHOTS_DIR', 'LOGS_DIR', 'RAG_DIR',
     'get_time_greeting', 'get_timestamp',
     'VoiceEngine', 'ListenEngine', 'GroqBrain', 'MemoryManager',
 ]

@@ -1,9 +1,15 @@
 """
-JARVIS v3 - Main Controller
+JARVIS v4 - Main Controller
 ===========================
-The brain that connects core engine, commands, and HUD.
+The brain that connects core engine, commands, HUD, chat DB, RAG, and agent tools.
 Handles: startup, wake word detection, command processing,
 text mode fallback, and graceful shutdown.
+
+v4 Changes:
+- Integrated SQLite chat history (jarvis_chat_db)
+- RAG document Q&A (jarvis_rag)
+- Multi-agent tool calling (jarvis_agent_tools)
+- Modern CustomTkinter HUD (jarvis_hud)
 """
 
 import os
@@ -11,11 +17,13 @@ import sys
 import time
 import signal
 import atexit
+import threading
 from datetime import datetime
 
 from jarvis_core import (
     voice, speak, listener, brain, memory,
     GROQ_API_KEY, OWNER_NAME, WAKE_WORD, MAX_MEMORY,
+    AGENT_TOOLS_ENABLED, RAG_ENABLED,
     get_time_greeting, get_timestamp, BASE_DIR
 )
 from jarvis_hud import hud, update_hud
@@ -45,6 +53,33 @@ from jarvis_commands import (
     get_time, get_date, shutdown_jarvis,
 )
 
+# v4 imports
+try:
+    from jarvis_chat_db import (
+        chat_db, create_conversation,
+        add_user_message as db_add_user_msg,
+        add_assistant_message as db_add_ai_msg,
+        get_conversation_messages, get_ai_context,
+    )
+    CHAT_DB_AVAILABLE = True
+except ImportError:
+    CHAT_DB_AVAILABLE = False
+    print("[WARNING] Chat database not available. Chat history disabled.")
+
+try:
+    from jarvis_rag import rag_engine
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    print("[WARNING] RAG system not available. Document Q&A disabled.")
+
+try:
+    from jarvis_agent_tools import agent, ask_with_tools
+    AGENT_AVAILABLE = True
+except ImportError:
+    AGENT_AVAILABLE = False
+    print("[WARNING] Agent tools not available. Tool calling disabled.")
+
 
 # ============================================================
 # ASCII ART
@@ -57,7 +92,7 @@ JARVIS_LOGO = r"""
 ██   ██║██╔══██║██╔══██╗╚██╗ ██╔╝██║╚════██║
 ╚█████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║███████║
  ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝
-          v3.0 - Your AI Assistant
+          v4.0 - Upgraded AI Assistant
 """
 
 
@@ -68,13 +103,30 @@ JARVIS_LOGO = r"""
 def startup():
     """Run the full JARVIS startup sequence."""
     print(JARVIS_LOGO)
-    print("=" * 50)
+    print("=" * 60)
     print(f"[{get_timestamp()}] Starting up...")
 
-    # Load config (already done in jarvis_core imports)
+    # Load config
     print(f"[{get_timestamp()}] Configuration loaded.")
     print(f"[{get_timestamp()}] Owner: {OWNER_NAME}")
     print(f"[{get_timestamp()}] Wake word: '{WAKE_WORD}'")
+
+    # Feature flags
+    print(f"[{get_timestamp()}] Features:")
+    print(f"  - Chat History (SQLite): {'ON' if CHAT_DB_AVAILABLE else 'OFF'}")
+    print(f"  - RAG Document Q&A: {'ON' if RAG_AVAILABLE else 'OFF'}")
+    print(f"  - Agent Tool Calling: {'ON' if AGENT_AVAILABLE else 'OFF'}")
+
+    # Initialize chat DB
+    if CHAT_DB_AVAILABLE:
+        conv_id = create_conversation("Default Session")
+        hud.current_conversation_id = conv_id
+        print(f"[{get_timestamp()}] Chat database initialized. Conv ID: {conv_id}")
+
+    # Initialize RAG
+    if RAG_AVAILABLE and rag_engine.is_ready():
+        stats = rag_engine.get_stats()
+        print(f"[{get_timestamp()}] RAG system ready. {stats.get('total_documents', 0)} documents indexed.")
 
     # Test microphone
     mic_available = listener.is_available()
@@ -92,18 +144,21 @@ def startup():
         print(f"[{get_timestamp()}] Get a free key at: https://console.groq.com/keys")
 
     # Start HUD
-    print(f"[{get_timestamp()}] Starting HUD...")
+    print(f"[{get_timestamp()}] Starting Modern HUD...")
     hud.start()
-    time.sleep(0.5)
+    time.sleep(1)
+
+    # Set up HUD callbacks
+    hud.on_send_message = handle_text_command
 
     # Greeting
     greeting = get_time_greeting()
     speak(greeting)
 
     # Feature summary
-    speak("Voice control ready. Say my name to activate.")
-    print(f"[{get_timestamp()}] JARVIS v3 is running!")
-    print("=" * 50)
+    speak("All systems operational. Say my name to activate.")
+    print(f"[{get_timestamp()}] JARVIS v4 is running!")
+    print("=" * 60)
 
     return mic_available
 
@@ -125,8 +180,35 @@ def process_command(text: str) -> bool:
 
     update_hud(status='thinking', command=text)
 
+    # Save user message to DB
+    if CHAT_DB_AVAILABLE and hud.current_conversation_id:
+        db_add_user_msg(hud.current_conversation_id, text)
+
     # --------------------------------------------------------
-    # PRIORITY 1 - Exact keyword matches
+    # PRIORITY 1 - v4 Features
+    # --------------------------------------------------------
+
+    # Document Q&A (RAG)
+    if RAG_AVAILABLE and any(w in text_lower for w in [
+        "ask document", "ask my document", "what does my document",
+        "what does the document", "search document", "document says",
+        "in my file", "in the file", "uploaded file", "uploaded document"
+    ]):
+        result = handle_rag_query(text)
+        speak(result)
+        return True
+
+    # Agent tool query (explicit)
+    if AGENT_AVAILABLE and any(w in text_lower for w in [
+        "search the web", "look up online", "what's the weather in",
+        "calculate ", "run python", "execute code", "system info detailed",
+    ]):
+        result = handle_agent_query(text)
+        speak(result)
+        return True
+
+    # --------------------------------------------------------
+    # PRIORITY 2 - Exact keyword matches
     # --------------------------------------------------------
 
     # Greetings
@@ -195,7 +277,6 @@ def process_command(text: str) -> bool:
 
     # Dice roll
     if any(w in text_lower for w in ["roll a dice", "roll dice", "roll a die"]):
-        # Check for sides specification
         nums = [int(w) for w in words if w.isdigit()]
         sides = nums[0] if nums else 6
         speak(roll_dice(sides))
@@ -269,7 +350,7 @@ def process_command(text: str) -> bool:
         return True
 
     # --------------------------------------------------------
-    # PRIORITY 2 - Pattern-based commands (partial matches)
+    # PRIORITY 3 - Pattern-based commands
     # --------------------------------------------------------
 
     # Open app
@@ -308,7 +389,6 @@ def process_command(text: str) -> bool:
             if trigger in text_lower:
                 query = text_lower.split(trigger, 1)[1].strip()
                 if query:
-                    # Detect search engine
                     engine = "google"
                     for eng in ["youtube", "github", "stackoverflow", "leetcode", "geeksforgeeks", "bing", "duckduckgo"]:
                         if eng in text_lower:
@@ -331,7 +411,7 @@ def process_command(text: str) -> bool:
     if any(w in text_lower for w in ["explain ", "what is ", "what are ", "how does ", "define "]):
         for trigger in ["explain ", "what is ", "what are ", "how does ", "define "]:
             if trigger in text_lower:
-                topic = text.split(trigger, 1)[1].strip()  # Use original case
+                topic = text.split(trigger, 1)[1].strip()
                 if topic:
                     speak(explain_concept(topic))
                     return True
@@ -383,18 +463,14 @@ def process_command(text: str) -> bool:
 
     # Set reminder
     if any(w in text_lower for w in ["remind me", "set reminder", "reminder"]):
-        # Parse: "remind me in 5 minutes drink water"
         reminder_text = text_lower
         time_str = ""
         message = ""
 
-        # Extract time portion
         if "in " in reminder_text:
             parts = reminder_text.split("in ", 1)[1]
-            # Time is usually first 2-3 words after "in"
             time_words = parts.split()[:3]
             time_str = " ".join(time_words)
-            # Message is the rest
             remaining = " ".join(parts.split()[3:])
             if remaining:
                 message = remaining
@@ -448,13 +524,102 @@ def process_command(text: str) -> bool:
         return True
 
     # --------------------------------------------------------
-    # PRIORITY 3 - Groq AI fallback
+    # PRIORITY 4 - AI fallback (with tools if enabled)
     # --------------------------------------------------------
 
-    # Send to AI for general conversation
+    # Try agent tools first if enabled
+    if AGENT_AVAILABLE and AGENT_TOOLS_ENABLED:
+        try:
+            result = ask_with_tools(text)
+            response = result.get("response", "I'm not sure how to help with that.")
+            speak(response)
+
+            # Show tool calls in HUD
+            tool_calls = result.get("tool_calls", [])
+            if tool_calls:
+                tc_summary = ", ".join([t["tool"] for t in tool_calls])
+                update_hud(status='thinking', response=f"Used tools: {tc_summary}")
+
+            return True
+        except Exception as e:
+            print(f"[AGENT ERROR] {e}")
+            # Fall through to basic AI
+
+    # Basic AI response
     ai_response = brain.ask_jarvis(text)
     speak(ai_response)
     return True
+
+
+def handle_text_command(text: str):
+    """Handle text commands from the GUI input."""
+    update_hud(status='thinking', command=text)
+
+    try:
+        process_command(text)
+    except Exception as e:
+        print(f"[COMMAND ERROR] {e}")
+        speak("Something went wrong with that command.")
+        update_hud(status='idle')
+
+
+def handle_rag_query(text: str) -> str:
+    """Handle a RAG document query."""
+    if not RAG_AVAILABLE:
+        return "RAG system is not available."
+
+    try:
+        # Extract the actual question
+        question = text
+        for prefix in [
+            "ask document", "ask my document", "what does my document say about",
+            "what does the document say about", "search document for",
+            "document says", "in my file", "in the file",
+            "uploaded file", "uploaded document"
+        ]:
+            if prefix in text.lower():
+                question = text.lower().split(prefix, 1)[1].strip()
+                break
+
+        result = rag_engine.ask_document(question)
+
+        if result["context"]:
+            # Generate AI response with context
+            ai_response = brain.ask_with_context(question, result["context"])
+
+            # Save to chat DB
+            if CHAT_DB_AVAILABLE and hud.current_conversation_id:
+                db_add_ai_msg(hud.current_conversation_id, ai_response)
+                hud.add_ai_message(ai_response)
+
+            return ai_response
+        else:
+            msg = f"I couldn't find relevant information in your documents for: '{question}'."
+            if CHAT_DB_AVAILABLE and hud.current_conversation_id:
+                db_add_ai_msg(hud.current_conversation_id, msg)
+            return msg
+
+    except Exception as e:
+        return f"Document Q&A error: {str(e)}"
+
+
+def handle_agent_query(text: str) -> str:
+    """Handle an agent tool query."""
+    if not AGENT_AVAILABLE:
+        return "Agent tools are not available."
+
+    try:
+        result = ask_with_tools(text)
+        response = result.get("response", "No response from agent.")
+
+        # Save to chat DB
+        if CHAT_DB_AVAILABLE and hud.current_conversation_id:
+            db_add_ai_msg(hud.current_conversation_id, response)
+            hud.add_ai_message(response)
+
+        return response
+    except Exception as e:
+        return f"Agent error: {str(e)}"
 
 
 # ============================================================
@@ -494,7 +659,6 @@ def activate_mode():
             speak("Something went wrong with that command.")
         return True
 
-    # Timeout - go back to sleep
     print(f"[{get_timestamp()}] No command received. Going back to sleep.")
     update_hud(status='idle')
     return False
@@ -506,10 +670,10 @@ def activate_mode():
 
 def text_mode():
     """Run JARVIS in text-only mode when microphone is unavailable."""
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("  TEXT MODE - Type commands at the prompt")
     print("  Type 'exit' or 'quit' to shutdown")
-    print("=" * 50 + "\n")
+    print("=" * 60 + "\n")
 
     speak("Text mode active. Type your commands.")
 
@@ -600,13 +764,22 @@ def shutdown():
     summary = memory.get_session_summary()
     memory.log_session_event(f"SESSION END - {summary}")
 
+    # Save chat stats
+    if CHAT_DB_AVAILABLE:
+        try:
+            stats = chat_db.get_stats()
+            print(f"[{get_timestamp()}] Chat stats: {stats['total_conversations']} conversations, "
+                  f"{stats['total_messages']} messages")
+        except Exception:
+            pass
+
     # Stop HUD
     hud.stop()
 
-    speak("Session ended." + summary)
+    speak("Session ended. " + summary)
     print(f"[{get_timestamp()}] {summary}")
-    print(f"[{get_timestamp()}] JARVIS v3 shutdown complete.")
-    print("=" * 50)
+    print(f"[{get_timestamp()}] JARVIS v4 shutdown complete.")
+    print("=" * 60)
 
     sys.exit(0)
 

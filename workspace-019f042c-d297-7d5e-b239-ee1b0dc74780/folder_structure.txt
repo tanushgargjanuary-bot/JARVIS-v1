@@ -1,0 +1,31 @@
+jarvis_v3/
+|
+|-- requirements.txt          # Python dependencies
+|-- .env.example              # Environment variable template
+|-- .env                      # Your private API keys (NOT in git)
+|-- .gitignore                # Git ignore rules
+|-- install.bat               # One-click Windows installer
+|-- run.bat                   # Normal launcher (with voice)
+|-- run_text_mode.bat         # Text-only launcher (no mic)
+|-- folder_structure.txt      # This file - project layout
+|
+|-- jarvis_core.py            # Voice engine, AI brain, memory system
+|-- jarvis_commands.py        # All voice commands (PC, Web, CSE, etc.)
+|-- jarvis_hud.py             # Floating status overlay (tkinter)
+|-- jarvis_main.py            # Main controller - connects everything
+|-- jarvis_config.py          # Central config - customize without touching code
+|-- test_jarvis.py            # Component test suite
+|
+|-- memory/                   # Persistent memory storage
+|   |-- jarvis_memory.json    # Saved facts, preferences, notes index
+|
+|-- notes/                    # Voice-created notes saved here
+|   |-- topic_20250115_143022.txt
+|
+|-- screenshots/              # Screenshots saved here
+|   |-- screenshot_20250115_143055.png
+|
+|-- logs/                     # Session logs
+|   |-- session_20250115.log
+|
+|-- README.md                 # Full documentation

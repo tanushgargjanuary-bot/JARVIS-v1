@@ -20,6 +20,12 @@ import json
 import subprocess
 import tempfile
 import traceback
+import ast
+import logging
+import shlex
+import socket
+import getpass
+import glob
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
@@ -32,6 +38,9 @@ from jarvis_core import (
     brain, speak, OWNER_NAME, BASE_DIR,
     SCREENSHOTS_DIR, NOTES_DIR
 )
+
+logger = logging.getLogger(__name__)
+READABLE_DIRS: List[str] = ["notes", "documents", "logs"]
 
 # ============================================================
 # TOOL DEFINITIONS (JSON Schema for Groq)
@@ -182,8 +191,8 @@ TOOL_DEFINITIONS = [
 class ToolExecutor:
     """Executes tool calls with safety checks and error handling."""
 
-    def __init__(self):
-        self.tools: Dict[str, Callable] = {
+    def __init__(self) -> None:
+        self.tools: Dict[str, Callable[..., Any]] = {
             "web_search": self.web_search,
             "run_python": self.run_python,
             "calculator": self.calculator,
@@ -277,23 +286,37 @@ class ToolExecutor:
     # --------------------------------------------------------
 
     @staticmethod
+    def is_safe_code(code: str) -> bool:
+        """Validate Python code safety using AST parsing."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            logger.warning(f"Security violation: AST syntax error: {e}")
+            return False
+
+        dangerous_names: set[str] = {'__import__', 'getattr', 'eval', 'exec', 'os', 'subprocess'}
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                logger.warning("Security violation: Unauthorized import statement detected in AST.")
+                return False
+            if isinstance(node, ast.Name) and node.id in dangerous_names:
+                logger.warning(f"Security violation: Unauthorized identifier '{node.id}' detected in AST.")
+                return False
+            if isinstance(node, ast.Attribute) and (node.attr in dangerous_names or node.attr.startswith('__')):
+                logger.warning(f"Security violation: Unauthorized attribute '{node.attr}' detected in AST.")
+                return False
+        return True
+
+    @staticmethod
     def run_python(code: str) -> str:
         """Execute Python code in a restricted environment."""
-        # Security: Block dangerous operations
-        dangerous_patterns = [
-            r'import\s+os.*system', r'os\.system', r'subprocess\.call',
-            r'subprocess\.run', r'__import__', r'eval\s*\(', r'exec\s*\(',
-            r'open\s*\(.*[\"\']r', r'open\s*\(.*[\"\']w',
-            r' shutil', r'import\s+ctypes', r'import\s+multiprocessing',
-        ]
-
-        for pattern in dangerous_patterns:
-            if re.search(pattern, code, re.IGNORECASE):
-                return f"Security error: Potentially dangerous code detected. Pattern blocked: {pattern}"
+        if not ToolExecutor.is_safe_code(code):
+            return "Security error: AST validation failed. Unauthorized imports, modules, or attributes detected."
 
         # Create restricted globals
-        safe_builtins = {
-            'abs': abs, 'all': all, 'any': any, 'ascii': ascii,
+        safe_builtins: Dict[str, Any] = {
+            'abs': abs, 'all': all, 'ascii': ascii,
             'bin': bin, 'bool': bool, 'bytearray': bytearray,
             'bytes': bytes, 'chr': chr, 'complex': complex,
             'dict': dict, 'dir': dir, 'divmod': divmod,
@@ -309,7 +332,7 @@ class ToolExecutor:
             'sum': sum, 'tuple': tuple, 'type': type, 'zip': zip,
         }
 
-        safe_globals = {
+        safe_globals: Dict[str, Any] = {
             "__builtins__": safe_builtins,
             "math": math,
             "json": json,
@@ -428,24 +451,34 @@ class ToolExecutor:
     # --------------------------------------------------------
 
     @staticmethod
-    def file_operations(action: str, path: str, content: str = None) -> str:
+    def file_operations(action: str, path: str, content: Optional[str] = None) -> str:
         """Read, write, list, or search files."""
         try:
-            base = Path(BASE_DIR)
-            target = base / path
+            base: Path = Path(BASE_DIR).resolve()
+            target: Path = (Path(BASE_DIR) / path).resolve()
 
             # Security: Ensure path is within project directory
             try:
-                target.resolve().relative_to(base.resolve())
+                rel_target = target.relative_to(base)
             except ValueError:
                 return "Security error: Path must be within the project directory."
 
+            # Block queries accessing .env files
+            if ".env" in target.name or ".env" in str(target):
+                return "Security error: Accessing .env files is blocked."
+
             if action == "read":
+                is_allowed: bool = False
+                if len(rel_target.parts) > 0 and rel_target.parts[0] in READABLE_DIRS:
+                    is_allowed = True
+                if not is_allowed:
+                    return f"Security error: Reading files outside allowed directories ({', '.join(READABLE_DIRS)}) is blocked."
+
                 if not target.exists():
                     return f"File not found: {path}"
                 if target.is_dir():
                     return f"'{path}' is a directory. Use 'list' to see contents."
-                text = target.read_text(encoding='utf-8', errors='ignore')
+                text: str = target.read_text(encoding='utf-8', errors='ignore')
                 if len(text) > 5000:
                     text = text[:5000] + "\n... (truncated, file too large)"
                 return f"Contents of {path}:\n```\n{text}\n```"
@@ -638,35 +671,109 @@ class ToolExecutor:
     @staticmethod
     def shell_command(command: str) -> str:
         """Run safe shell commands."""
-        # Security: Block dangerous commands
-        dangerous = [
-            'rm -rf /', 'rm -rf /*', 'mkfs', 'dd if=', ':(){:|:&};:',
-            '> /dev/sda', 'del /f /s /q', 'format ', 'rd /s /q',
-            'shutdown', 'reboot', 'poweroff', 'init 0',
+        chaining_tokens: List[str] = ['&&', '||', '|', ';', '&', '>', '<', '`', '$(']
+        if any(token in command for token in chaining_tokens):
+            return "Security error: Command chaining or redirection is blocked."
+
+        dangerous: List[str] = [
+            'rm -rf', 'mkfs', 'dd if=', ':(){:|:&};:',
+            'del /f', 'format ', 'rd /s', 'shutdown', 'reboot', 'poweroff', 'init 0',
         ]
 
-        cmd_lower = command.lower()
+        cmd_lower: str = command.lower().strip()
         for d in dangerous:
             if d in cmd_lower:
                 return f"Security error: Dangerous command blocked: {d}"
 
-        # Only allow safe commands
-        allowed_prefixes = [
-            'dir', 'ls', 'cd ', 'pwd', 'echo', 'type', 'cat ', 'head ',
-            'tail ', 'find ', 'grep', 'wc ', 'date', 'whoami', 'hostname',
-            'python --version', 'pip list', 'pip --version',
-        ]
+        posix_flag: bool = (os.name != 'nt')
+        try:
+            args: List[str] = shlex.split(command, posix=posix_flag)
+        except ValueError:
+            args = command.split()
 
-        is_allowed = any(cmd_lower.strip().startswith(p) for p in allowed_prefixes)
-        if not is_allowed:
+        if not args:
+            return "No command provided."
+
+        cmd_name: str = args[0].lower()
+
+        if cmd_name in ('dir', 'ls'):
+            target_dir: Path = Path(BASE_DIR)
+            recursive: bool = False
+            for arg in args[1:]:
+                if arg.lower() in ('/s', '-r', '-la', '-l', '-a', '/b'):
+                    if arg.lower() in ('/s', '-r'):
+                        recursive = True
+                elif not arg.startswith('-') and not arg.startswith('/'):
+                    target_dir = Path(BASE_DIR) / arg
+
+            if not target_dir.exists():
+                return f"Directory not found: {target_dir}"
+            if not target_dir.is_dir():
+                return f"Not a directory: {target_dir}"
+
+            try:
+                items: List[str] = []
+                if recursive:
+                    for p in target_dir.rglob('*'):
+                        items.append(str(p.relative_to(target_dir)))
+                else:
+                    for p in sorted(target_dir.iterdir()):
+                        prefix = "[DIR]" if p.is_dir() else "[FILE]"
+                        items.append(f"{prefix} {p.name}")
+                output: str = "\n".join(items[:100])
+                if len(items) > 100:
+                    output += "\n... (output truncated)"
+                return f"Output:\n```\n{output}\n```"
+            except Exception as e:
+                return f"Error listing directory: {e}"
+
+        elif cmd_name == 'pwd':
+            return f"Output:\n```\n{Path.cwd()}\n```"
+
+        elif cmd_name == 'cd':
+            if len(args) > 1:
+                try:
+                    os.chdir(args[1])
+                    return f"Changed directory to: {os.getcwd()}"
+                except Exception as e:
+                    return f"Error changing directory: {e}"
+            return f"Current directory: {os.getcwd()}"
+
+        elif cmd_name == 'echo':
+            return f"Output:\n```\n{' '.join(args[1:])}\n```"
+
+        elif cmd_name in ('cat', 'type'):
+            if len(args) < 2:
+                return "No file specified."
+            file_path = Path(BASE_DIR) / args[1]
+            if not file_path.exists():
+                return f"File not found: {args[1]}"
+            try:
+                content: str = file_path.read_text(encoding='utf-8', errors='replace')
+                if len(content) > 3000:
+                    content = content[:3000] + "\n... (output truncated)"
+                return f"Output:\n```\n{content}\n```"
+            except Exception as e:
+                return f"Error reading file: {e}"
+
+        elif cmd_name == 'whoami':
+            return f"Output:\n```\n{getpass.getuser()}\n```"
+
+        elif cmd_name == 'hostname':
+            return f"Output:\n```\n{socket.gethostname()}\n```"
+
+        elif cmd_name == 'date':
+            return f"Output:\n```\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n```"
+
+        allowed_externals: List[str] = ['find', 'grep', 'wc', 'head', 'tail', 'python', 'pip']
+        if not any(cmd_name == ext or cmd_name.endswith(ext) for ext in allowed_externals):
             return (f"Command not in allowed list. Allowed: dir/ls, cd, pwd, echo, "
-                   f"cat/type, head, tail, find, grep, wc, date, whoami, hostname, "
-                   f"python --version, pip list")
+                    f"cat/type, head, tail, find, grep, wc, date, whoami, hostname, python, pip")
 
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                args,
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -694,7 +801,7 @@ class ToolExecutor:
     # MAIN EXECUTION
     # ============================================================
 
-    def execute(self, tool_name: str, arguments: Dict) -> str:
+    def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Execute a tool by name with given arguments."""
         if tool_name not in self.tools:
             return f"Unknown tool: {tool_name}"
@@ -718,10 +825,10 @@ class AgentInterface:
     Handles tool use loops and response streaming.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.executor = ToolExecutor()
 
-    def process_with_tools(self, user_message: str) -> Dict:
+    def process_with_tools(self, user_message: str) -> Dict[str, Any]:
         """
         Process a user message with potential tool calls.
         Returns: {"response": str, "tool_calls": list}
@@ -732,14 +839,21 @@ class AgentInterface:
                 "tool_calls": []
             }
 
-        tool_calls_log = []
-        messages = [
+        tool_calls_log: List[Dict[str, Any]] = []
+        messages: List[Dict[str, Any]] = [
             {"role": "system", "content": brain.SYSTEM_PROMPT},
             {"role": "user", "content": user_message}
         ]
 
         max_iterations = 5
         for iteration in range(max_iterations):
+            if not brain.check_rate_limit():
+                msg: str = "Rate limit exceeded. Maximum 10 requests per minute allowed. Please wait for a cooldown period."
+                speak(msg)
+                return {
+                    "response": msg,
+                    "tool_calls": tool_calls_log,
+                }
             try:
                 response = brain.client.chat.completions.create(
                     messages=messages,
@@ -806,6 +920,12 @@ class AgentInterface:
                     }
 
             except Exception as e:
+                error_str: str = str(e).lower()
+                if any(sub in error_str for sub in ["authentication", "401", "api_key"]):
+                    return {
+                        "response": "Authentication failed. Verify your GROQ_API_KEY environment variable configuration.",
+                        "tool_calls": tool_calls_log,
+                    }
                 return {
                     "response": f"Error processing request: {str(e)}",
                     "tool_calls": tool_calls_log,
@@ -826,7 +946,7 @@ class AgentInterface:
 agent = AgentInterface()
 
 
-def ask_with_tools(question: str) -> Dict:
+def ask_with_tools(question: str) -> Dict[str, Any]:
     """Convenience function to ask JARVIS with tool calling."""
     return agent.process_with_tools(question)
 

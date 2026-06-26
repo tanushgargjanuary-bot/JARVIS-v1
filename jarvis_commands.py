@@ -98,7 +98,7 @@ def open_app(name: str) -> str:
                     return f"Could not open {name}: {e}"
         # Try subprocess fallback
         try:
-            subprocess.Popen(paths[0], shell=True)
+            subprocess.Popen([os.path.expandvars(paths[0])], shell=False)
             return f"Opening {name}."
         except Exception as e:
             return f"Failed to open {name}: {e}"
@@ -115,7 +115,7 @@ def open_app(name: str) -> str:
                     except Exception:
                         pass
             try:
-                subprocess.Popen(paths[0], shell=True)
+                subprocess.Popen([os.path.expandvars(paths[0])], shell=False)
                 return f"Opening {app_name}."
             except Exception as e:
                 return f"Failed to open {app_name}: {e}"

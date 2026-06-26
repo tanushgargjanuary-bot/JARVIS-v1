@@ -17,6 +17,7 @@ import time
 import random
 import re
 import threading
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -283,37 +284,52 @@ class GroqBrain:
         f"The user's name is {OWNER_NAME}."
     )
 
-    def __init__(self):
-        self.client = None
+    def __init__(self) -> None:
+        self.client: Optional[Groq] = None
         self.conversation_memory: List[Dict[str, str]] = []
+        self.rate_limit_queue: deque[float] = deque()
         self._init_client()
         self._setup_memory()
 
-    def _init_client(self):
+    def check_rate_limit(self) -> bool:
+        """Check rolling window rate limit (max 10 executions per minute)."""
+        now: float = time.time()
+        while self.rate_limit_queue and now - self.rate_limit_queue[0] >= 60.0:
+            self.rate_limit_queue.popleft()
+        if len(self.rate_limit_queue) >= 10:
+            return False
+        self.rate_limit_queue.append(now)
+        return True
+
+    def _init_client(self) -> None:
         """Initialize Groq client with API key."""
         if GROQ_API_KEY and GROQ_API_KEY != "your_groq_key_here":
             try:
                 self.client = Groq(api_key=GROQ_API_KEY)
                 print("[OK] Groq AI brain connected.")
             except Exception as e:
-                print(f"[ERROR] Groq client init failed: {e}")
+                err_str: str = str(e).lower()
+                if any(sub in err_str for sub in ["authentication", "401", "api_key"]):
+                    print("Authentication failed. Verify your GROQ_API_KEY environment variable configuration.")
+                else:
+                    print(f"[ERROR] Groq client init failed: {e}")
                 self.client = None
         else:
             print("[WARNING] No valid GROQ_API_KEY. AI responses will be unavailable.")
             self.client = None
 
-    def _setup_memory(self):
+    def _setup_memory(self) -> None:
         """Initialize conversation memory with system prompt."""
         self.conversation_memory = [
             {"role": "system", "content": self.SYSTEM_PROMPT}
         ]
 
-    def add_to_memory(self, role: str, content: str):
+    def add_to_memory(self, role: str, content: str) -> None:
         """Add a message to conversation memory."""
         self.conversation_memory.append({"role": role, "content": content})
         self.trim_memory()
 
-    def trim_memory(self):
+    def trim_memory(self) -> None:
         """Keep only the last MAX_MEMORY messages (preserving system prompt)."""
         if len(self.conversation_memory) <= MAX_MEMORY + 1:
             return
@@ -322,13 +338,18 @@ class GroqBrain:
         recent = self.conversation_memory[-MAX_MEMORY:]
         self.conversation_memory = [system_msg] + recent
 
-    def ask_jarvis(self, prompt: str, model: str = None, max_tokens: int = 512) -> str:
+    def ask_jarvis(self, prompt: str, model: Optional[str] = None, max_tokens: int = 512) -> str:
         """
         Send prompt to Groq and return AI response.
         Handles rate limits, auth errors, and network issues.
         """
         if not self.client:
             return "AI brain is offline. Check your GROQ_API_KEY in the .env file."
+
+        if not self.check_rate_limit():
+            msg: str = "Rate limit exceeded. Maximum 10 requests per minute allowed. Please wait for a cooldown period."
+            speak(msg)
+            return msg
 
         self.add_to_memory("user", prompt)
 
@@ -339,22 +360,22 @@ class GroqBrain:
                 max_tokens=max_tokens,
                 temperature=0.7,
             )
-            response = chat_completion.choices[0].message.content
+            response: str = chat_completion.choices[0].message.content or ""
             self.add_to_memory("assistant", response)
             return response
 
         except Exception as e:
-            error_str = str(e).lower()
-            if "rate limit" in error_str:
+            error_str: str = str(e).lower()
+            if any(sub in error_str for sub in ["authentication", "401", "api_key", "auth"]):
+                return "Authentication failed. Verify your GROQ_API_KEY environment variable configuration."
+            elif "rate limit" in error_str:
                 return "I'm getting too many requests. Please wait a moment and try again."
-            elif "authentication" in error_str or "auth" in error_str:
-                return "Authentication failed. Please check your Groq API key."
             elif "connection" in error_str or "network" in error_str:
                 return "Network issue. Please check your internet connection."
             else:
                 return f"AI brain hiccupped: {str(e)[:100]}. Try again?"
 
-    def ask_with_tools(self, prompt: str) -> Dict:
+    def ask_with_tools(self, prompt: str) -> Dict[str, Any]:
         """Ask JARVIS with potential tool calling (requires agent_tools module)."""
         if not AGENT_TOOLS_ENABLED:
             return {"response": self.ask_jarvis(prompt), "tool_calls": []}
@@ -462,7 +483,7 @@ class MemoryManager:
         self.persistent_memory.setdefault("facts", []).append(entry)
         self._save_memory()
 
-    def save_note_ref(self, filename: str, topic: str):
+    def save_note_ref(self, filename: str, topic: str) -> None:
         """Save a note reference to memory."""
         entry = {
             "filename": filename,
@@ -472,7 +493,7 @@ class MemoryManager:
         self.persistent_memory.setdefault("notes", []).append(entry)
         self._save_memory()
 
-    def search_memory(self, keyword: str) -> List[Dict]:
+    def search_memory(self, keyword: str) -> List[Dict[str, Any]]:
         """Search persistent memory for matching entries."""
         results = []
         keyword_lower = keyword.lower()

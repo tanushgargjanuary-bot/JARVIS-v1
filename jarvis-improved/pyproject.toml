@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-assistant"
+version = "2.0.0"
+description = "Lightweight AI voice assistant powered by Groq API (Llama 3)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["voice-assistant", "ai", "groq", "llama3", "desktop"]
+dependencies = [
+    "groq>=0.4.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+voice = ["speechrecognition>=3.10.0", "pyttsx3>=2.90", "pyaudio>=0.2.14"]
+gui   = ["pyautogui>=0.9.54", "screen-brightness-control>=0.21.0"]
+ui    = ["customtkinter>=5.2.0", "Pillow>=10.0.0"]
+rag   = ["chromadb>=0.4.0", "sentence-transformers>=2.2.0", "PyPDF2>=3.0.0", "python-docx>=0.8.11"]
+fun   = ["pyjokes>=0.6.0"]
+all   = ["jarvis-assistant[voice,gui,ui,rag,fun]"]
+dev   = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0"]
+
+[project.scripts]
+jarvis = "jarvis.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E701", "E702"]  # Allow compact one-liners for lean codebase
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

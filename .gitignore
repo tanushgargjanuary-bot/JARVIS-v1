@@ -3,6 +3,7 @@
 
 # Environment variables (API keys!)
 .env
+.env.*
 
 # Python
 __pycache__/
